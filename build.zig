@@ -13,7 +13,12 @@ pub fn build(b: *std.Build) !void {
         b.installArtifact(exe);
 
         // modules
+        const zig_clap = b.createModule(.{
+                .source_file = .{ .path = "zig-clap/clap.zig" }
+        });
 
+        // add modules to exe
+        exe.addModule("zig_clap", zig_clap);
 
         // steps
         const artifact_step = b.addRunArtifact(exe);
