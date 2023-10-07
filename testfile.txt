@@ -1,0 +1,2 @@
+this is an example file containing example info
+will emulate the existance of another file, that's supposed to determine the validity of another file
