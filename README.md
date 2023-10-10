@@ -17,8 +17,9 @@ If none of the files have changed and a valid password was supplied, the key wil
 At least Zig master (0.12.0-dev.706+62a0fbdae) is required
 1. Clone the repo: `git clone https://github.com/spflaumer/fphc.git`
 2. Change directory into the repo: `cd fphc`
-3. Run the build command: `zig build`
-4. The output file will be within `zig-out/bin`
+3. Initialize submodules: `git submodule update --init --recursive`
+4. Run the build command: `zig build`
+5. The output file will be within `zig-out/bin`
 
 ## Things that need fixing:
 - password is echoed onto the terminal
