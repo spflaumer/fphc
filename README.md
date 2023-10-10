@@ -13,6 +13,13 @@ If any files change, the resulting key will be invalid
 If none of the files have changed, but a bad password was supplied, the key will be invalid
 If none of the files have changed and a valid password was supplied, the key will be valid
 
+## How to build:
+At least Zig master (0.12.0-dev.706+62a0fbdae) is required
+1. Clone the repo: `git clone https://github.com/spflaumer/fphc.git`
+2. Change directory into the repo: `cd fphc`
+3. Run the build command: `zig build`
+4. The output file will be within `zig-out/bin`
+
 ## Things that need fixing:
 - password is echoed onto the terminal
 - only files can be currently supplied for hashing. implement hashing of directories
