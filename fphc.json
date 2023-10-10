@@ -1,0 +1,9 @@
+{
+        "input": [
+                ".gitignore",
+                ".gitmodules"
+        ],
+        "output": "key",
+        "stdout": true,
+        "threads": 6
+}

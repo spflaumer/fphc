@@ -1,147 +1,252 @@
-// modules import
 const std = @import("std");
-const zig_clap = @import("zig_clap");
 
-// "shortcuts"
-const sha = std.crypto.hash.sha3.Sha3_512;
+const ArenaAlloc = std.heap.ArenaAllocator;
+const page_alloc = std.heap.page_allocator;
+const sha512 = std.crypto.hash.sha3.Sha3_512;
+const Thread = std.Thread;
+const ArrayList = std.ArrayList;
 
-/// commandline arguments atructure
-const cmdArgs = struct {
-        output: []const u8,
-        input: []const u8,
+/// print a string with formatting to stdout
+fn print(comptime format: []const u8, args: anytype) !void {
+        // get a handle to stdout
+        var sout = std.io.getStdOut();
+        // initialize a buffered writer
+        var sout_buffered = std.io.bufferedWriter(sout.writer());
+        // print to stdout
+        try sout_buffered.writer().print(format, args);
+        // flush the buffer completing the print operation
+        try sout_buffered.flush();
+}
+
+/// read and store an entire file
+/// caller owns returned memory
+fn readFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+        // get a handle to the current working directory
+        const cwd = std.fs.cwd();
+
+        // verify that that is infact a file
+        const stat = try cwd.statFile(path);
+        if(stat.kind != .file) {
+                std.debug.print("{s} isn't a file!\n", .{path});
+                return error.NotAFile;
+        }
+
+        // open the file
+        const file = try cwd.openFile(path, .{ .mode = .read_only });
+        defer file.close();
+
+        // read the entire file
+        var result = try file.readToEndAlloc(allocator, stat.size + 1);
+
+        return result;
+}
+
+const FPHCConf = struct {
+        threads: u16,
+        input: [][]u8,
+        output: []u8,
+        stdout: bool,
+
+        const Self = @This();
+
+        pub fn fromJSON(json_str: []const u8, allocator: std.mem.Allocator) !FPHCConf {
+                // create a json object from the input json string
+                const conf_json = try std.json.parseFromSlice(Self, allocator, json_str, .{});
+                defer conf_json.deinit();
+
+                // initialize and return the config struct
+                return .{
+                        .threads = conf_json.value.threads,
+                        .input = conf_json.value.input,
+                        .output = conf_json.value.output,
+                        .stdout = conf_json.value.stdout,
+                };
+        }
 };
 
-/// parse given commandline arguments
-fn parseArgs(allocator: std.mem.Allocator) !cmdArgs {
-        // create help/argument description
-        const help = 
-                \\-h, --help                    Display this help message and exit
-                \\-o, --output  <str>           Specify the output: filename. otherwise stdout is used (no conversion to hex is done and no newline is used)
-                \\-i, --input   <str>           Input filename (later on optionally multiple and/or foldername; all files within the folder would then be parsed recursively)
-                \\
-        ;
+/// the state of the program
+const FPHC = struct {
+        const Self = @This();
 
-        // parse argument description
-        const params = comptime zig_clap.parseParamsComptime(help);
+        _threads: u16,
+        _input: ArrayList([]u8),
+        _output: []const u8,
+        _stdout: bool,
+        _arena: ArenaAlloc,
+        // only used once
+        _alloc: std.mem.Allocator,
 
-        // parse the arguments given
-        var res = try zig_clap.parse(zig_clap.Help, &params, zig_clap.parsers.default, .{});
-        defer res.deinit();
+        /// allocator should NOT be from an ArenaAllocator
+        /// instead call deinit() afterwards
+        pub fn init(conf: *FPHCConf, allocator: std.mem.Allocator) !Self {
+                // arena is stored within the struct
+                var arena = ArenaAlloc.init(allocator);
+                var input = ArrayList([]u8).init(arena.allocator());
+                try input.appendSlice(conf.input);
 
-        // print the help and exit with status SUCCESS
-        if(res.args.help != 0) {
-                std.debug.print("{s}", .{help});
-                std.os.exit(0);
-        }
-
-        // allocate either an array of length of the `output` given
-        // or with the length of "stdout"
-        var output: []u8 = try allocator.alloc(u8, if(res.args.output) |out| out.len else 6);
-        if(res.args.output) |out| {
-                // copy the output filename
-                @memcpy(output, out);
-        } else {
-                // set output to "stdout"
-                @memcpy(output, "stdout");
-        }
-
-        // same as above, except exit when no input filename was provided
-        var input: []u8 = try allocator.alloc(u8, if(res.args.input) |in| in.len else {
-                std.debug.print("No input filename was supplied!\n", .{});
-                std.os.exit(1);
-        });
-        if(res.args.input) |in| {
-                @memcpy(input, in);
-        }
-
-        return cmdArgs {
-                .input = input,
-                .output = output,
-        };
-}
-
-/// read the entire file into one allocated buffer
-/// caller owns the memory
-fn readFileAlloc(filename: []const u8, allocator: std.mem.Allocator) ![]u8 {
-        // open the file
-        var file = try std.fs.cwd().openFile(filename, .{});
-        // get file statistics
-        var stat = try file.stat();
-        // read everything from the file
-        return try file.readToEndAlloc(allocator, stat.size + 1);
-}
-
-/// print implementation
-/// does not return bytes written/printed
-fn print(comptime format: []const u8, args: anytype) !void {
-        var buffered_stdout = std.io.getStdOut();
-        try buffered_stdout.writer().print(format, args);
-}
-
-/// get maximum of 255 characters of user input, or until '\n'
-fn getUserIn(prompt: ?[]const u8, allocator: std.mem.Allocator) !?[]u8 {
-        // print the prompt
-        if(prompt) |p| try print("{s}", .{p});
-
-        // get handle to stdin
-        var stdin = std.io.getStdIn();
-        return try stdin.reader().readUntilDelimiterOrEofAlloc(allocator, '\n', 255);
-}
-
-/// overwrites an existing file with new file contents
-/// clears the file when contents are null
-/// bytes written are not returned
-fn writeFile(filename: []const u8, contents: []const u8) !void {
-        var cwd = std.fs.cwd();
-        _ = cwd.statFile(filename) catch |err| {
-                try switch (err) {
-                        error.FileNotFound => _ = try cwd.createFile(filename, .{}),
-                        else => err,
+                return .{
+                        ._threads = conf.threads,
+                        ._input = input,
+                        ._output = conf.output,
+                        ._stdout = conf.stdout,
+                        ._arena = arena,
+                        ._alloc = allocator,
                 };
-        };
+        }
 
-        var file = try std.fs.cwd().openFile(filename, .{ .mode = .read_write });
-        _ = try file.writer().writeAll(contents);
-}
+        /// a wrapper around input_files.popOrNull() using mutexes
+        inline fn ___input_files_popOrNull_wrapper(input_files: *ArrayList([]u8), mutex_input: *Thread.Mutex) ?[]u8 {
+                mutex_input.lock();
+                defer mutex_input.unlock();
+                return input_files.popOrNull();
+        }
+
+        /// used by Self.hashFiles() for multi-threading
+        /// allocator should NOT be an ArenaAllocator
+        fn __hashInput(allocator: std.mem.Allocator, input_files: *ArrayList([]u8), mutex_input: *Thread.Mutex, hash_files: *ArrayList([64]u8)) !void {
+                while(___input_files_popOrNull_wrapper(input_files, mutex_input)) |path| {
+                        // allocate the file only to hash it
+                        // deallocate immediately after the same iteration of the loop to avoid memory hogging
+                        var content_file = try readFile(path, allocator);
+                        defer allocator.free(content_file);
+
+                        // the digest length of sha512 is 512bit * (1 / 8)byte = 64 bytes
+                        var out_hash: [64]u8 = .{0}**64;
+                        // hash the file
+                        sha512.hash(content_file, &out_hash, .{});
+                        try hash_files.append(out_hash);
+                }
+        }
+
+        /// hash the input files using threads
+        ///! upgrade this to use Thread.Pool sometime later
+        fn _hashFiles(self: *Self) ![64]u8 {
+                // the hash of input files
+                // freed by Self.deinit()
+                var hash_files = ArrayList([64]u8).init(self._arena.allocator());
+
+                // get the core count
+                const count_cpu = try Thread.getCpuCount();
+
+                // allocatoe a list of threads
+                var threads = ArrayList(Thread).init(self._arena.allocator());
+
+                // input_files mutex
+                var input_mutex = std.Thread.Mutex{};
+
+                // create and allocate threads
+                for (0..count_cpu) |_| {
+                        try threads.append(try Thread.spawn(.{}, __hashInput, .{self._alloc, &self._input, &input_mutex, &hash_files}));
+                }
+
+                // wait for the threads to finish
+                while (threads.popOrNull()) |thread| {
+                        thread.join();
+                }
+
+                // concatenate all the hashes to rehash them
+                var hashes_combined = try self._arena.allocator().alloc(u8, hash_files.items.len * 64);
+
+                var res_hash: [64]u8 = .{0}**64;
+                // hash the concatenated hashes
+                sha512.hash(hashes_combined, &res_hash, .{});
+
+                return res_hash;
+        }
+
+        /// gets user input and hashes it
+        ///!! need to find a way to hide the password/turn off character echo on input
+        ///!! or replace them with asterisks or the like
+        fn _hashPwd(self: *Self) ![64]u8 {
+                // get a handle to stdin
+                const stdin = std.io.getStdIn();
+
+                // create an ArrayList to store the input
+                var input = std.ArrayList(u8).init(self._arena.allocator());
+                defer input.deinit();  // technically a no-op considering .toOwnedSlice() is used
+
+                // prompt for the password
+                try print("Please enter your password:\n", .{});
+
+                // read from stdin
+                try stdin.reader().streamUntilDelimiter(input.writer(), '\n', null);
+                // convert the ArrayList to a slice
+                const slice_input = try input.toOwnedSlice();
+
+                // hash the input
+                var hash_input: [64]u8 = .{0}**64;
+                sha512.hash(slice_input, &hash_input, .{});
+
+                return hash_input;
+        }
+
+        /// combine both sha3_512 hashes into one sha3_512 hash
+        fn __combineHash(self: *Self, hash_a: *[64]u8, hash_b: *[64]u8) ![]u8 {
+                var hash_combined = try self._arena.allocator().alloc(u8, 128);
+                std.mem.copy(u8, hash_combined[0..64], hash_a);
+                std.mem.copy(u8, hash_combined[64..], hash_b);
+                return hash_combined;
+        }
+
+        /// writes the key to stdout or to a file
+        fn _writeKey(self: *Self, key: [64]u8) !void {
+                if(self._stdout) {
+                        // if the config demands stdout
+                        // print to stdout
+                        try print("{s}\n", .{key});
+                } else {
+                        // open a handle to the cwd
+                        const cwd = std.fs.cwd();
+
+                        // create a file and truncate if it exists
+                        _ = try cwd.createFile(self._output, .{ .truncate = true });
+
+                        // open the file with write_only permission
+                        var file = try cwd.openFile(self._output, .{ .mode = .write_only });
+                        defer file.close();
+
+                        // write to the file
+                        try file.writer().writeAll(&key);
+                }
+        }
+
+        /// get the key from specified files and the password of the user
+        pub fn getKey(self: *Self) !void {
+                // get the hash of the users password first
+                // the user won't have to wait for the files to finish hashing
+                var hash_user = try self._hashPwd();
+
+                // get the hash of the files specified within fphc.json
+                var hash_files = try self._hashFiles();
+
+                // combine/concatenate the hashes
+                var hash_combined = try self.__combineHash(&hash_user, &hash_files);
+
+                // rehash the hashes
+                var hash_final: [64]u8 = .{0}**64;
+                sha512.hash(hash_combined, &hash_final, .{});
+
+                // create the key
+                try self._writeKey(hash_final);
+        }
+
+        pub fn deinit(self: *Self) void {
+                self._arena.allocator().free(self._output);
+                self._input.deinit();
+                self._arena.deinit();
+        }
+};
 
 pub fn main() !void {
-        // initialize the arenaallocator
+        // initialize an ArenaAllocator
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
 
-        // parse the arguments given
-        var args = try parseArgs(arena.allocator());
+        // read the config file
+        const fphc_conf = try FPHCConf.fromJSON(try readFile("fphc.json", arena.allocator()), arena.allocator());
+        // initialize program state
+        var fphc = try FPHC.init(@constCast(&fphc_conf), std.heap.page_allocator);
+        defer fphc.deinit();
 
-        // read the input of the file
-        var file_contents = try readFileAlloc(args.input, arena.allocator());
-
-        // create the hash
-        var file_hash: [64]u8 = .{0}**64;
-        sha.hash(file_contents, &file_hash, .{});
-
-        // get user input
-        var userin = try getUserIn("enter your password: ", arena.allocator());
-
-        // hash user input
-        var userin_hash: [64]u8 = .{0}**64;
-        if(userin) |ui| sha.hash(ui, &userin_hash, .{});
-
-        // combine both hashes
-        var combined_hash: [128]u8 = .{0}**128;
-        for (0..64) |i| {
-                combined_hash[i] = userin_hash[i];
-        }
-        for (64..128) |i| {
-                combined_hash[i] = file_hash[i-64];
-        }
-
-        // hash the combined hash
-        var final_hash: [64]u8 = .{0}**64;
-        sha.hash(@as([]const u8, &combined_hash), &final_hash, .{});
-
-        if(std.mem.eql(u8, args.output, "stdout")){
-                try print("{s}", .{final_hash});
-        } else {
-                try writeFile(args.output, @as([]const u8, &final_hash));
-        }
+        try fphc.getKey();
 }
